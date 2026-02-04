@@ -1,0 +1,289 @@
+@Library('company-shared-library') _
+
+/**
+ * Complete pipeline example with Buildah + ORAS
+ * - Build Maven application
+ * - Push artifacts to Nexus OCI registry (ORAS)
+ * - Build container image (Buildah)
+ * - Push image to registry
+ * - Deploy with ArgoCD (optional)
+ */
+
+pipeline {
+    agent any
+    
+    environment {
+        // Registry configuration
+        REGISTRY = 'nexus.company.com'
+        
+        // Application details
+        GROUP_ID = 'com.company'
+        ARTIFACT_ID = 'myapp'
+        VERSION = "${env.BUILD_NUMBER}"
+        
+        // Image details
+        IMAGE_NAME = "${ARTIFACT_ID}"
+        IMAGE_TAG = "${VERSION}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build & Test') {
+            steps {
+                sh '''
+                    mvn clean package
+                    mvn test
+                '''
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                    jacoco()
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    pipeline { services ->
+                        services.sonarqube.analyzeMaven(
+                            projectKey: "${GROUP_ID}:${ARTIFACT_ID}",
+                            projectName: ARTIFACT_ID,
+                            projectVersion: VERSION
+                        )
+                        
+                        services.sonarqube.waitForQualityGate(
+                            timeout: 5,
+                            abortOnFailure: true
+                        )
+                    }
+                }
+            }
+        }
+        
+        stage('Push Maven Artifacts (ORAS)') {
+            steps {
+                script {
+                    pipeline { services ->
+                        echo "📦 Pushing Maven artifacts to Nexus OCI registry..."
+                        
+                        services.oras.pushMavenArtifact(
+                            groupId: GROUP_ID,
+                            artifactId: ARTIFACT_ID,
+                            version: VERSION,
+                            registry: REGISTRY,
+                            repository: 'maven-oci',
+                            includeSources: true,
+                            includeJavadoc: true,
+                            annotations: [
+                                'org.opencontainers.image.created': new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                                'org.opencontainers.image.revision': env.GIT_COMMIT,
+                                'org.opencontainers.image.source': env.GIT_URL,
+                                'build.number': env.BUILD_NUMBER,
+                                'build.url': env.BUILD_URL
+                            ]
+                        )
+                        
+                        echo "✅ Maven artifacts pushed successfully"
+                    }
+                }
+            }
+        }
+        
+        stage('Build Container Image (Buildah)') {
+            steps {
+                script {
+                    pipeline { services ->
+                        echo "🔨 Building container image with Buildah..."
+                        
+                        def image = services.buildah.build(
+                            imageName: IMAGE_NAME,
+                            imageTag: IMAGE_TAG,
+                            dockerfile: 'Containerfile',
+                            context: '.',
+                            buildArgs: [
+                                JAR_FILE: "target/${ARTIFACT_ID}-${VERSION}.jar",
+                                VERSION: VERSION,
+                                BUILD_DATE: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                            ],
+                            format: 'oci',
+                            layers: true
+                        )
+                        
+                        echo "✅ Container image built: ${image.fullName}"
+                        
+                        // Scan for vulnerabilities
+                        echo "🔍 Scanning image for vulnerabilities..."
+                        def scanResult = services.buildah.scan(image,
+                            tool: 'trivy',
+                            severity: 'HIGH,CRITICAL'
+                        )
+                        
+                        if (!scanResult.success) {
+                            echo "⚠️ Vulnerabilities found! Check ${scanResult.reportFile}"
+                            archiveArtifacts artifacts: scanResult.reportFile
+                        } else {
+                            echo "✅ No critical vulnerabilities found"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Push Container Image') {
+            steps {
+                script {
+                    pipeline { services ->
+                        echo "🚀 Pushing container image to registry..."
+                        
+                        def image = new ado.models.ContainerImage(
+                            name: IMAGE_NAME,
+                            tag: IMAGE_TAG
+                        )
+                        
+                        services.buildah.push(image,
+                            registry: REGISTRY,
+                            credentialsId: 'nexus-credentials'
+                        )
+                        
+                        echo "✅ Image pushed: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+        
+        stage('Push Documentation (ORAS)') {
+            steps {
+                script {
+                    echo "📚 Pushing documentation to Nexus..."
+                    
+                    orasPush(
+                        reference: "${REGISTRY}/docs/${ARTIFACT_ID}:${VERSION}",
+                        files: [
+                            'README.md:text/markdown',
+                            'CHANGELOG.md:text/markdown'
+                        ],
+                        annotations: [
+                            'documentation.version': VERSION,
+                            'build.number': env.BUILD_NUMBER
+                        ],
+                        artifactType: 'application/vnd.company.documentation'
+                    )
+                    
+                    echo "✅ Documentation pushed"
+                }
+            }
+        }
+        
+        stage('Deploy to Dev (ArgoCD)') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    pipeline { services ->
+                        echo "🚢 Deploying to development environment..."
+                        
+                        services.argocd.syncApp(
+                            appName: "${ARTIFACT_ID}-dev",
+                            revision: "v${VERSION}"
+                        )
+                        
+                        def deployed = services.argocd.waitForSync(
+                            "${ARTIFACT_ID}-dev",
+                            300
+                        )
+                        
+                        if (deployed) {
+                            echo "✅ Deployed successfully to dev"
+                        } else {
+                            error("❌ Deployment to dev failed")
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Production (ArgoCD)') {
+            when {
+                branch 'main'
+            }
+            input {
+                message "Deploy to production?"
+                ok "Deploy"
+            }
+            steps {
+                script {
+                    pipeline { services ->
+                        echo "🚢 Deploying to production environment..."
+                        
+                        services.argocd.syncApp(
+                            appName: "${ARTIFACT_ID}-prod",
+                            revision: "v${VERSION}"
+                        )
+                        
+                        def deployed = services.argocd.waitForSync(
+                            "${ARTIFACT_ID}-prod",
+                            600
+                        )
+                        
+                        if (deployed) {
+                            echo "✅ Deployed successfully to production"
+                            
+                            // Create Jira comment
+                            if (env.JIRA_ISSUE) {
+                                services.jira.addComment(
+                                    env.JIRA_ISSUE,
+                                    "🎉 Version ${VERSION} deployed to production\\nBuild: ${env.BUILD_URL}"
+                                )
+                            }
+                        } else {
+                            error("❌ Deployment to production failed")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo """
+                ╔════════════════════════════════════════╗
+                ║   🎉 BUILD SUCCESSFUL 🎉              ║
+                ╠════════════════════════════════════════╣
+                ║ Artifact: ${GROUP_ID}:${ARTIFACT_ID}
+                ║ Version:  ${VERSION}
+                ║ Image:    ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                ║ Build:    ${env.BUILD_NUMBER}
+                ╚════════════════════════════════════════╝
+                """
+            }
+        }
+        failure {
+            script {
+                echo """
+                ╔════════════════════════════════════════╗
+                ║   ❌ BUILD FAILED ❌                   ║
+                ╠════════════════════════════════════════╣
+                ║ Build:    ${env.BUILD_NUMBER}
+                ║ URL:      ${env.BUILD_URL}
+                ╚════════════════════════════════════════╝
+                """
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

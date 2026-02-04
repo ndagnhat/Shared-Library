@@ -1,0 +1,46 @@
+# Multi-stage build example for Java application
+FROM registry.access.redhat.com/ubi9/openjdk-17:1.18 AS builder
+
+WORKDIR /app
+
+# Copy Maven wrapper and pom.xml
+COPY mvnw .
+COPY .mvn .mvn
+COPY pom.xml .
+
+# Download dependencies (cached layer)
+RUN ./mvnw dependency:go-offline
+
+# Copy source code and build
+COPY src ./src
+RUN ./mvnw clean package -DskipTests
+
+# Runtime stage
+FROM registry.access.redhat.com/ubi9/openjdk-17-runtime:1.18
+
+ARG JAR_FILE=target/*.jar
+ARG VERSION=latest
+ARG BUILD_DATE
+
+LABEL org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.title="MyApp" \
+      org.opencontainers.image.description="Example Java application"
+
+WORKDIR /app
+
+# Copy JAR from builder
+COPY --from=builder /app/target/*.jar app.jar
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+  CMD curl -f http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["java", "-jar", "app.jar"]

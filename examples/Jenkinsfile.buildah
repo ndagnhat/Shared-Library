@@ -1,0 +1,95 @@
+@Library('company-shared-library') _
+
+pipeline {
+    agent any
+    
+    environment {
+        REGISTRY = 'nexus.company.com'
+        IMAGE_NAME = 'myapp'
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build Application') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+        
+        stage('Build Container Image') {
+            steps {
+                script {
+                    buildahBuild(
+                        imageName: env.IMAGE_NAME,
+                        imageTag: env.IMAGE_TAG,
+                        dockerfile: 'Containerfile',
+                        context: '.',
+                        buildArgs: [
+                            VERSION: env.IMAGE_TAG,
+                            BUILD_DATE: sh(script: 'date -u +"%Y-%m-%dT%H:%M:%SZ"', returnStdout: true).trim()
+                        ],
+                        format: 'oci',
+                        isolation: 'chroot'
+                    )
+                }
+            }
+        }
+        
+        stage('Scan Image') {
+            steps {
+                script {
+                    pipeline { services ->
+                        def image = new ado.models.ContainerImage(
+                            name: env.IMAGE_NAME,
+                            tag: env.IMAGE_TAG
+                        )
+                        
+                        def scanResult = services.buildah.scan(image, 
+                            tool: 'trivy',
+                            severity: 'HIGH,CRITICAL'
+                        )
+                        
+                        if (!scanResult.success) {
+                            echo "⚠️ Vulnerabilities found! Check ${scanResult.reportFile}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    pipeline { services ->
+                        def image = new ado.models.ContainerImage(
+                            name: env.IMAGE_NAME,
+                            tag: env.IMAGE_TAG
+                        )
+                        
+                        services.buildah.push(image,
+                            registry: env.REGISTRY,
+                            credentialsId: 'nexus-credentials'
+                        )
+                        
+                        echo "✅ Image pushed: ${env.REGISTRY}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}

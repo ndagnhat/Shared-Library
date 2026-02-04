@@ -1,0 +1,106 @@
+@Library('company-shared-library') _
+
+pipeline {
+    agent any
+    
+    environment {
+        REGISTRY = 'nexus.company.com'
+        ARTIFACT_NAME = 'myapp'
+        VERSION = "${env.BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build Maven Project') {
+            steps {
+                sh 'mvn clean package'
+            }
+        }
+        
+        stage('Push Maven Artifacts to Nexus OCI') {
+            steps {
+                script {
+                    pipeline { services ->
+                        // Push Maven artifacts as OCI artifact
+                        services.oras.pushMavenArtifact(
+                            groupId: 'com.company',
+                            artifactId: env.ARTIFACT_NAME,
+                            version: env.VERSION,
+                            registry: env.REGISTRY,
+                            repository: 'maven-oci',
+                            includeSources: true,
+                            includeJavadoc: true,
+                            annotations: [
+                                'build.number': env.BUILD_NUMBER,
+                                'git.commit': env.GIT_COMMIT,
+                                'jenkins.url': env.BUILD_URL
+                            ]
+                        )
+                        
+                        echo "✅ Maven artifacts pushed to ${env.REGISTRY}/maven-oci"
+                    }
+                }
+            }
+        }
+        
+        stage('Push Documentation') {
+            steps {
+                script {
+                    orasPush(
+                        reference: "${env.REGISTRY}/docs/${env.ARTIFACT_NAME}:${env.VERSION}",
+                        files: [
+                            'README.md:text/markdown',
+                            'CHANGELOG.md:text/markdown',
+                            'target/site/apidocs/index.html:text/html'
+                        ],
+                        annotations: [
+                            'org.opencontainers.image.title': 'Documentation',
+                            'org.opencontainers.image.version': env.VERSION,
+                            'build.number': env.BUILD_NUMBER
+                        ],
+                        artifactType: 'application/vnd.company.docs'
+                    )
+                    
+                    echo "✅ Documentation pushed to ${env.REGISTRY}/docs"
+                }
+            }
+        }
+        
+        stage('Push Test Reports') {
+            steps {
+                script {
+                    orasPush(
+                        reference: "${env.REGISTRY}/reports/${env.ARTIFACT_NAME}:${env.VERSION}",
+                        files: [
+                            'target/surefire-reports/TEST-*.xml:application/xml',
+                            'target/site/jacoco/index.html:text/html'
+                        ],
+                        annotations: [
+                            'report.type': 'test-results',
+                            'build.number': env.BUILD_NUMBER
+                        ]
+                    )
+                    
+                    echo "✅ Test reports pushed to ${env.REGISTRY}/reports"
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "🎉 All artifacts successfully pushed to Nexus OCI registry!"
+        }
+        failure {
+            echo "❌ Pipeline failed"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
